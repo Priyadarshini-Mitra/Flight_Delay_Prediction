@@ -1,0 +1,1067 @@
+---
+title: "Team miners flight delay prediction"
+author: 
+date: 'Assigned: February 1, 2018'
+output: 
+  html_document:
+    toc: true
+    toc_depth: 5
+    theme: paper
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+#libraries
+library(doParallel)
+library(plyr)
+library(dplyr)
+library(sqldf)
+library(ggplot2)
+library(ISLR)
+library(glmnet)
+library(leaps)  
+library(boot)   
+library(stringr)
+library(MASS)
+library(klaR)
+library(rpart)
+library(randomForest)
+library(partykit)
+library(pROC)
+library(corrplot)
+library(caret)
+library(gbm)
+```
+
+
+```{r}
+
+##Change the line below to the location of the file
+Pittsburgh_flight_details <- read.csv("d:\\users\\shina\\downloads\\Pittsburgh_flight_details2.csv")
+
+Pfdnn <- filter(Pittsburgh_flight_details, CANCELLED == 0 & DIVERTED == 0)
+
+#head(Pfdnn,10)
+cl<-makeCluster(4)
+registerDoParallel(cl)
+
+```
+
+#The following data has been prepared for Feature engineering
+#We created an indicator of whether a previous flight with the same tail number was delayed in the last 24 hours 
+#We created also the counts of the number of flights that occur within 15 , 30 , 60 minutes of each flight.
+
+#COUNTDEP15  -  gives the  no of flights ocurring in the same +- 15  minute window .
+#COUNTDEP30  -  gives the  no of flights occurring in the +- 30  minute window . 
+#COUNTDEP60   - gives the  no of flights occurring in the +- 60  minute window . 
+#PREV_ARRDELAY24 - within 24 hours , If a certain flight connects to another location and if its first travel is delayed 
+#then this  filght (tail number) will be more likely to cause delay for  the subsequent travels as well .So this variable will be marked such as a row (flight) with the value of 1 .
+
+```{r cache=TRUE}
+#Feature engineering
+
+#Pittsburgh_flight_details_nocancel_nodiverted$ID <- seq.int(nrow(Pittsburgh_flight_details_nocancel_nodiverted))
+
+#Pfdnn$ID
+
+#Converting the Scheduled arrival date and scheduled arrival time to date formats that are more manageable
+
+#Pfdnn<-Pittsburgh_flight_details_nocancel_nodiverted #Just renaming to make code more readable
+
+set.seed(123)
+
+Pfdnn$SCHED_DEP<-strptime(paste(Pfdnn$FL_DATE, str_pad(Pfdnn$CRS_DEP_TIME,4,pad="0")), "%Y-%m-%d %H%M")
+Pfdnn$SCHED_ARR<-strptime(paste(Pfdnn$FL_DATE, str_pad(Pfdnn$CRS_ARR_TIME,4,pad="0")), "%Y-%m-%d %H%M")
+
+Pfdnn$ACT_DEP<-strptime(paste(Pfdnn$FL_DATE, str_pad(Pfdnn$DEP_TIME,4,pad="0")), "%Y-%m-%d %H%M")
+Pfdnn$ACT_ARR<-strptime(paste(Pfdnn$FL_DATE, str_pad(Pfdnn$ARR_TIME,4,pad="0")), "%Y-%m-%d %H%M")
+
+Pfdnn$SCHED_ARR<-as.POSIXct(Pfdnn$SCHED_ARR)
+Pfdnn$SCHED_DEP<-as.POSIXct(Pfdnn$SCHED_DEP)
+Pfdnn$ACT_ARR<-as.POSIXct(Pfdnn$ACT_ARR)
+Pfdnn$ACT_DEP<-as.POSIXct(Pfdnn$ACT_DEP)
+
+
+##We add 24 hours to arrivals that have a time that is earlier than the departure time
+Pfdnn$SCHED_ARR<-ifelse(Pfdnn$SCHED_ARR-Pfdnn$SCHED_DEP>0,Pfdnn$SCHED_ARR,Pfdnn$SCHED_ARR+3600*24)
+Pfdnn$ACT_DEP<-ifelse(Pfdnn$ACT_DEP-Pfdnn$SCHED_DEP<0&Pfdnn$DEP_DELAY>0,Pfdnn$ACT_DEP+3600*24,Pfdnn$ACT_DEP)
+Pfdnn$ACT_ARR<-ifelse(Pfdnn$ACT_ARR-Pfdnn$ACT_DEP>0,Pfdnn$ACT_ARR,Pfdnn$ACT_ARR+3600*24)
+
+
+#Convert back to POSIXct because the operation above for some reason makes it lose the format
+Pfdnn$SCHED_ARR<-as.POSIXct(Pfdnn$SCHED_ARR,origin="1970-01-01 00:00.00 UTC")
+Pfdnn$ACT_DEP<-as.POSIXct(Pfdnn$ACT_DEP,origin="1970-01-01 00:00.00 UTC")
+Pfdnn$ACT_ARR<-as.POSIXct(Pfdnn$ACT_ARR,origin="1970-01-01 00:00.00 UTC")
+
+
+#Here we create the values for the number of flights that are arriving or departing withing 15, 30 and 60 minutes of the departure time of each flight that is leaving Pittsburgh. This value is left as 0 for flights arriving to Pittsburgh.
+#Pfdnn$COUNTARR15<-0
+Pfdnn$COUNTDEP15<-0
+
+#Pfdnn$COUNTARR30<-0
+Pfdnn$COUNTDEP30<-0
+
+#Pfdnn$COUNTARR60<-0
+Pfdnn$COUNTDEP60<-0
+
+Pfdnn$PREV_ARRDELAY24<-0
+
+deps<-which(Pfdnn$ORIGIN_CITY_NAME=="Pittsburgh, PA")
+arrs<-which(Pfdnn$DEST_CITY_NAME=="Pittsburgh, PA")
+
+#The for loop that adds value to the variables created above. It takes some time.
+for (i in deps){
+  countdep<-length(which(abs(difftime(Pfdnn$SCHED_DEP[i],Pfdnn$SCHED_DEP[deps],units="mins"))<=15))
+  countarr<-length(which(abs(difftime(Pfdnn$SCHED_DEP[i],Pfdnn$SCHED_ARR[arrs],units="mins"))<=15))
+  Pfdnn$COUNTDEP15[i]<-countdep+countarr
+  countdep<-length(which(abs(difftime(Pfdnn$SCHED_DEP[i],Pfdnn$SCHED_DEP[deps],units="mins"))<=30))
+  countarr<-length(which(abs(difftime(Pfdnn$SCHED_DEP[i],Pfdnn$SCHED_ARR[arrs],units="mins"))<=30))
+  Pfdnn$COUNTDEP30[i]<-countdep+countarr
+  countdep<-length(which(abs(difftime(Pfdnn$SCHED_DEP[i],Pfdnn$SCHED_DEP[deps],units="mins"))<=60))
+  countarr<-length(which(abs(difftime(Pfdnn$SCHED_DEP[i],Pfdnn$SCHED_ARR[arrs],units="mins"))<=60))
+  Pfdnn$COUNTDEP60[i]<-countdep+countarr
+  prevdel24<-which(difftime(Pfdnn$SCHED_DEP[i],Pfdnn$SCHED_ARR[arrs],units="hours")<=24
+                   & difftime(Pfdnn$SCHED_DEP[i],Pfdnn$SCHED_ARR[arrs],units="hours")>0
+                   & Pfdnn$TAIL_NUM[i]==Pfdnn$TAIL_NUM[arrs]
+                   & Pfdnn$ARR_DEL15[arrs]==1)
+  Pfdnn$PREV_ARRDELAY24[i] <-ifelse(length(prevdel24)>0,1,0)
+}
+
+##COMMENTED THIS CODE as I am already doing it above
+if(FALSE) 
+{Pittsburgh_flights_f1<-sqldf("
+                              select A.*,
+                              (select max(ARR_DEL15) 
+                              from Pfdnn as B 
+                              where A.TAIL_NUM = B.TAIL_NUM 
+                              AND ((A.FL_DATE = B.FL_DATE AND B.ARR_TIME < A.DEP_TIME)
+                              OR (A.FL_DATE = B.FL_DATE + 1 AND )
+                              and A.Origin = 'PIT' and B.Dest='PIT'
+                              
+                              )
+                              B.ARR_DELAY as Incoming_delay_ind from Pfdnn as A
+                              left join(
+                              select ID,  ARR_DELAY from (
+                              select ID, Departure_from_PIT.TAIL_NUM as TAIL_NUM,Departure_from_PIT.Origin as Origin, Departure_from_PIT.DEST as DEST,                 Departure_from_PIT.FL_NUM as FL_NUM,Departure_from_PIT.DEP_DEL15 as DEP_DELAY, Arrival_in_PIT.ARR_DEL15  as ARR_DELAY
+                              from 
+                              (select ID, Origin, DEST,TAIL_NUM, FL_NUM,DEP_DEL15, FL_DATE from Pfdnn
+                              where Origin in ('PIT')) as Departure_from_PIT
+                              join
+                              (select Origin, DEST,TAIL_NUM, FL_NUM,ARR_DEL15, FL_DATE  from Pfdnn
+                              where DEST in ('PIT')) as Arrival_in_PIT
+                              on Departure_from_PIT.TAIL_NUM = Arrival_in_PIT.TAIL_NUM
+                              AND Departure_from_PIT.FL_DATE = Arrival_in_PIT.FL_DATE
+                              Order by Departure_from_PIT.TAIL_NUM)) as B 
+                              on A.ID=B.ID")
+
+sqldf("select count(*) from Pittsburgh_flights_f1 where DEP_DEL15 =1")
+}
+
+
+
+depDF<-Pfdnn[deps,]
+
+nrow(depDF)
+
+set.seed(123)
+
+test.index<-sample(c(1:nrow(depDF)),nrow(depDF)*0.3)
+train.index<-c(1:nrow(depDF))[-test.index]
+
+
+
+depDFTest<-depDF[test.index,]
+depDFTrain<-depDF[train.index,]
+
+depDFTest$FL_NUM<-as.factor(depDFTest$FL_NUM)
+depDFTrain$FL_NUM<-as.factor(depDFTrain$FL_NUM)
+depDFTrain$MONTH<-as.factor(depDFTrain$MONTH)
+depDFTrain$DAY_OF_MONTH<-as.factor(depDFTrain$DAY_OF_MONTH)
+depDFTrain$DAY_OF_WEEK<-as.factor(depDFTrain$DAY_OF_WEEK)
+depDFTrain$QUARTER<-as.factor(depDFTrain$QUARTER)
+depDFTrain$PREV_ARRDELAY24<-as.factor(depDFTrain$PREV_ARRDELAY24)
+depDFTest$MONTH<-as.factor(depDFTest$MONTH)
+depDFTest$DAY_OF_MONTH<-as.factor(depDFTest$DAY_OF_MONTH)
+depDFTest$DAY_OF_WEEK<-as.factor(depDFTest$DAY_OF_WEEK)
+depDFTest$QUARTER<-as.factor(depDFTest$QUARTER)
+depDFTest$PREV_ARRDELAY24<-as.factor(depDFTest$PREV_ARRDELAY24)
+
+
+```
+
+Peparation of 2017 data
+PittsburghFlights2017
+
+We prepare the 2017 Pittsburgh flight data for the predictions using our different models
+```{r cache=TRUE}
+
+PittsburghFlights2017 <- read.csv("d:\\users\\shina\\downloads\\Pittsburgh2017.csv")
+
+Pfdnn2017 <- filter(PittsburghFlights2017, CANCELLED == 0 & DIVERTED == 0)
+
+
+
+Pfdnn2017$SCHED_DEP<-strptime(paste(Pfdnn2017$FL_DATE, str_pad(Pfdnn2017$CRS_DEP_TIME,4,pad="0")), "%Y-%m-%d %H%M")
+Pfdnn2017$SCHED_ARR<-strptime(paste(Pfdnn2017$FL_DATE, str_pad(Pfdnn2017$CRS_ARR_TIME,4,pad="0")), "%Y-%m-%d %H%M")
+
+Pfdnn2017$ACT_DEP<-strptime(paste(Pfdnn2017$FL_DATE, str_pad(Pfdnn2017$DEP_TIME,4,pad="0")), "%Y-%m-%d %H%M")
+Pfdnn2017$ACT_ARR<-strptime(paste(Pfdnn2017$FL_DATE, str_pad(Pfdnn2017$ARR_TIME,4,pad="0")), "%Y-%m-%d %H%M")
+
+Pfdnn2017$SCHED_ARR<-as.POSIXct(Pfdnn2017$SCHED_ARR)
+Pfdnn2017$SCHED_DEP<-as.POSIXct(Pfdnn2017$SCHED_DEP)
+Pfdnn2017$ACT_ARR<-as.POSIXct(Pfdnn2017$ACT_ARR)
+Pfdnn2017$ACT_DEP<-as.POSIXct(Pfdnn2017$ACT_DEP)
+
+
+##We add 24 hours to arrivals that have a time that is earlier than the departure time
+Pfdnn2017$SCHED_ARR<-ifelse(Pfdnn2017$SCHED_ARR-Pfdnn2017$SCHED_DEP>0,Pfdnn2017$SCHED_ARR,Pfdnn2017$SCHED_ARR+3600*24)
+Pfdnn2017$ACT_DEP<-ifelse(Pfdnn2017$ACT_DEP-Pfdnn2017$SCHED_DEP<0&Pfdnn2017$DEP_DELAY>0,Pfdnn2017$ACT_DEP+3600*24,Pfdnn2017$ACT_DEP)
+Pfdnn2017$ACT_ARR<-ifelse(Pfdnn2017$ACT_ARR-Pfdnn2017$ACT_DEP>0,Pfdnn2017$ACT_ARR,Pfdnn2017$ACT_ARR+3600*24)
+
+
+#Convert back to POSIXct because the operation above for some reason makes it lose the format
+Pfdnn2017$SCHED_ARR<-as.POSIXct(Pfdnn2017$SCHED_ARR,origin="1970-01-01 00:00.00 UTC")
+Pfdnn2017$ACT_DEP<-as.POSIXct(Pfdnn2017$ACT_DEP,origin="1970-01-01 00:00.00 UTC")
+Pfdnn2017$ACT_ARR<-as.POSIXct(Pfdnn2017$ACT_ARR,origin="1970-01-01 00:00.00 UTC")
+
+
+#Here we create the values for the number of flights that are arriving or departing withing 15, 30 and 60 minutes of the departure time of each flight that is leaving Pittsburgh. This value is left as 0 for flights arriving to Pittsburgh.
+#Pfdnn2017$COUNTARR15<-0
+Pfdnn2017$COUNTDEP15<-0
+
+#Pfdnn2017$COUNTARR30<-0
+Pfdnn2017$COUNTDEP30<-0
+
+#Pfdnn2017$COUNTARR60<-0
+Pfdnn2017$COUNTDEP60<-0
+
+Pfdnn2017$PREV_ARRDELAY24<-0
+
+deps<-which(Pfdnn2017$ORIGIN_CITY_NAME=="Pittsburgh, PA")
+arrs<-which(Pfdnn2017$DEST_CITY_NAME=="Pittsburgh, PA")
+
+
+
+
+#The for loop that adds value to the variables created above. It takes some time.
+for (i in deps){
+  countdep<-length(which(abs(difftime(Pfdnn2017$SCHED_DEP[i],Pfdnn2017$SCHED_DEP[deps],units="mins"))<=15))
+  countarr<-length(which(abs(difftime(Pfdnn2017$SCHED_DEP[i],Pfdnn2017$SCHED_ARR[arrs],units="mins"))<=15))
+  Pfdnn2017$COUNTDEP15[i]<-countdep+countarr
+  countdep<-length(which(abs(difftime(Pfdnn2017$SCHED_DEP[i],Pfdnn2017$SCHED_DEP[deps],units="mins"))<=30))
+  countarr<-length(which(abs(difftime(Pfdnn2017$SCHED_DEP[i],Pfdnn2017$SCHED_ARR[arrs],units="mins"))<=30))
+  Pfdnn2017$COUNTDEP30[i]<-countdep+countarr
+  countdep<-length(which(abs(difftime(Pfdnn2017$SCHED_DEP[i],Pfdnn2017$SCHED_DEP[deps],units="mins"))<=60))
+  countarr<-length(which(abs(difftime(Pfdnn2017$SCHED_DEP[i],Pfdnn2017$SCHED_ARR[arrs],units="mins"))<=60))
+  Pfdnn2017$COUNTDEP60[i]<-countdep+countarr
+  prevdel24<-which(difftime(Pfdnn2017$SCHED_DEP[i],Pfdnn2017$SCHED_ARR[arrs],units="hours")<=24
+                   & difftime(Pfdnn2017$SCHED_DEP[i],Pfdnn2017$SCHED_ARR[arrs],units="hours")>0
+                   & Pfdnn2017$TAIL_NUM[i]==Pfdnn2017$TAIL_NUM[arrs]
+                   & Pfdnn2017$ARR_DEL15[arrs]==1)
+  Pfdnn2017$PREV_ARRDELAY24[i] <-ifelse(length(prevdel24)>0,1,0)
+}
+
+depDF2017<-Pfdnn2017[deps,]
+
+for(i in names(depDF2017)){
+  if(!i %in% names(depDFTrain)){
+    depDF2017<-depDF2017[-which(names(depDF2017)==i)]
+  }
+}
+
+for(i in names(depDF2017)){
+  iname = which(names(depDF2017)==i)
+  if (is.factor(depDF2017[,iname])){
+    levels2006<-levels(depDFTrain[,which(names(depDFTrain)==i)])
+    missing<-which(!levels2006 %in% levels(depDF2017[,iname]))
+    if (length(missing)>0) {
+      levels(depDF2017[,iname])<-c(levels(depDF2017[,iname]),levels2006[missing])
+    }
+  }
+}
+  
+depDF2017$FL_NUM<-as.factor(depDF2017$FL_NUM)
+depDF2017$MONTH<-as.factor(depDF2017$MONTH)
+depDF2017$DAY_OF_MONTH<-as.factor(depDF2017$DAY_OF_MONTH)
+depDF2017$DAY_OF_WEEK<-as.factor(depDF2017$DAY_OF_WEEK)
+depDF2017$QUARTER<-as.factor(depDF2017$QUARTER)
+depDF2017$PREV_ARRDELAY24<-as.factor(depDF2017$PREV_ARRDELAY24)
+
+
+
+```
+
+
+
+Visualizations
+```{r}
+
+attach(Pfdnn)
+
+hist(Pfdnn$MONTH)
+
+#Histograms of number of flights happening in the same +-15, 30 and 60 minute window
+hist(Pfdnn$COUNTDEP15[deps])
+hist(Pfdnn$COUNTDEP30[deps])
+hist(Pfdnn$COUNTDEP60[deps])
+
+
+##Probabilities of each flight being delayed according to the number of flights occuring in the same +-15, 30 and 60 minute window
+tab15<-table(Pfdnn$COUNTDEP15[deps],Pfdnn$DEP_DEL15[deps])
+tab15<-cbind(tab15,tab15[,"1"]/(tab15[,"0"]+tab15[,"1"]))
+tab30<-table(Pfdnn$COUNTDEP30[deps],Pfdnn$DEP_DEL15[deps])
+tab30<-cbind(tab30,tab30[,"1"]/(tab30[,"0"]+tab30[,"1"]))
+tab60<-table(Pfdnn$COUNTDEP60[deps],Pfdnn$DEP_DEL15[deps])
+tab60<-cbind(tab60,tab60[,"1"]/(tab60[,"0"]+tab60[,"1"]))
+
+qplot(as.numeric(rownames(tab15)),geom="bar",weight=tab15[,3],xlab="Flights in the same +-15 minute window")
+qplot(as.numeric(rownames(tab30)),geom="bar",weight=tab30[,3],xlab="Flights in the same +-30 minute window")
+qplot(as.numeric(rownames(tab60)),geom="bar",weight=tab60[,3],xlab="Flights in the same +-60 minute window")
+
+
+##Percentage of delays in arrival and departures by airline
+tabAirLineDep<-table(UNIQUE_CARRIER,DEP_DEL15)
+tabAirLineDep<-cbind(tabAirLineDep,tabAirLineDep[,"1"]/(tabAirLineDep[,"0"]+tabAirLineDep[,"1"]))
+tabAirLineArr<-table(UNIQUE_CARRIER,ARR_DEL15)
+tabAirLineArr<-cbind(tabAirLineArr,tabAirLineArr[,"1"]/(tabAirLineArr[,"0"]+tabAirLineArr[,"1"]))
+
+qplot(rownames(tabAirLineDep),geom="bar",weight=tabAirLineDep[,3],xlab="Airline",ylab="% of Departure delays")
+qplot(rownames(tabAirLineArr),geom="bar",weight=tabAirLineArr[,3],xlab="Airline",ylab="% of Arrival delays")
+
+tabArrDelay24<-table(PREV_ARRDELAY24[deps],DEP_DEL15[deps])
+tabArrDelay24<-cbind(tabArrDelay24,tabArrDelay24[,"1"]/(tabArrDelay24[,"0"]+tabArrDelay24[,"1"]))
+
+qplot(rownames(tabArrDelay24),geom="bar",weight=tabArrDelay24[,3], xlab="Previous arrival delayed", ylab="Departure delayed %")
+
+tabDayOfWeek<-table(DAY_OF_WEEK,DEP_DEL15)
+tabDayOfWeek<-cbind(tabDayOfWeek,tabDayOfWeek[,"1"]/(tabDayOfWeek[,"0"]+tabDayOfWeek[,"1"]))
+
+qplot(rownames(tabDayOfWeek),geom="bar",weight=tabDayOfWeek[,3], xlab="Day of the week", ylab="Departure delayed %")
+
+tabMonth<-table(MONTH,DEP_DEL15)
+tabMonth<-cbind(tabMonth,tabMonth[,"1"]/(tabMonth[,"0"]+tabMonth[,"1"]))
+
+qplot(as.numeric(rownames(tabMonth)),geom="bar",weight=tabMonth[,3], xlab="Month", ylab="Departure delayed %")
+
+
+tabDayOfMONTH<-table(DAY_OF_MONTH,DEP_DEL15)
+tabDayOfMONTH<-cbind(tabDayOfMONTH,tabDayOfMONTH[,"1"]/(tabDayOfMONTH[,"0"]+tabDayOfMONTH[,"1"]))
+
+qplot(as.numeric(rownames(tabDayOfMONTH)),geom="bar",weight=tabDayOfMONTH[,3], xlab="Day of the MONTH", ylab="Departure delayed %")
+
+```
+
+
+Lasso with CV
+
+We are usinh Lasso with Cross validation to select the best predictors for our model. We are using measure of Area Under the Curve (AUC)  to choose our model.
+
+```{r cache=TRUE}
+##create the x and y parameters of the lasso, ommiting variablesthat occur AFTER departure delay
+
+
+x<-model.matrix(~ QUARTER+MONTH+DAY_OF_MONTH+DAY_OF_WEEK+UNIQUE_CARRIER+AIRLINE_ID+CARRIER+ORIGIN_AIRPORT_ID+ORIGIN_AIRPORT_SEQ_ID+ORIGIN_CITY_MARKET_ID+ORIGIN+ORIGIN_CITY_NAME+ORIGIN_STATE_ABR+ORIGIN_STATE_FIPS+ORIGIN_STATE_NM+ORIGIN_WAC+DEST_AIRPORT_ID+DEST_AIRPORT_SEQ_ID+DEST_CITY_MARKET_ID+DEST+DEST_CITY_NAME+DEST_STATE_ABR+DEST_STATE_FIPS+DEST_STATE_NM+DEST_WAC+DEP_TIME_BLK+ARR_TIME_BLK+CRS_ELAPSED_TIME+FLIGHTS+DISTANCE+DISTANCE_GROUP+COUNTDEP15+COUNTDEP30+COUNTDEP60+PREV_ARRDELAY24,depDFTrain)
+y<-as.matrix(depDFTrain[,names(depDFTrain) %in% c("DEP_DEL15")])
+
+deps.lasso <- glmnet(x, y=as.factor(y), family="binomial")
+
+#deps.lasso$lambda
+
+set.seed(123)
+deps.lasso.cv2=cv.glmnet(x=x,y=as.factor(y),family="binomial", type.measure = "auc")
+
+```
+
+
+
+
+
+
+Here we are visualizing the Lasso models which have minimum error and also minimum error plus one standard error.
+```{r}
+plot(deps.lasso, xvar="lambda")
+
+plot(deps.lasso.cv2)
+
+deps.lasso.cv2$lambda.min
+deps.lasso.cv2$lambda.1se
+minI=which(deps.lasso.cv2$lambda==deps.lasso.cv2$lambda.min)
+OneSDI=which(deps.lasso.cv2$lambda==deps.lasso.cv2$lambda.1se)
+min=coef(deps.lasso.cv2, s=deps.lasso.cv2$lambda.min)
+ose=coef(deps.lasso.cv2, s=deps.lasso.cv2$lambda.1se)
+
+minDF=data.frame(name = min@Dimnames[[1]][min@i + 1], coefficient = min@x)
+
+minDF
+
+oseDF=data.frame(name = ose@Dimnames[[1]][ose@i + 1], coefficient = ose@x)
+
+oseDF
+
+
+deps.lasso.cv2$cvm[OneSDI]
+
+```
+
+We are creating matrix input for Lasso. We are using logistic regression within Lasso and hence we are able to predict with Lasso. We are using measure of AUC to measure performance of Lasso.
+
+```{r}
+xt<-model.matrix(~ QUARTER+MONTH+DAY_OF_MONTH+DAY_OF_WEEK+UNIQUE_CARRIER+AIRLINE_ID+CARRIER+ORIGIN_AIRPORT_ID+ORIGIN_AIRPORT_SEQ_ID+ORIGIN_CITY_MARKET_ID+ORIGIN+ORIGIN_CITY_NAME+ORIGIN_STATE_ABR+ORIGIN_STATE_FIPS+ORIGIN_STATE_NM+ORIGIN_WAC+DEST_AIRPORT_ID+DEST_AIRPORT_SEQ_ID+DEST_CITY_MARKET_ID+DEST+DEST_CITY_NAME+DEST_STATE_ABR+DEST_STATE_FIPS+DEST_STATE_NM+DEST_WAC+DEP_TIME_BLK+ARR_TIME_BLK+CRS_ELAPSED_TIME+FLIGHTS+DISTANCE+DISTANCE_GROUP+COUNTDEP15+COUNTDEP30+COUNTDEP60+PREV_ARRDELAY24,depDFTest)
+yt<-as.matrix(depDFTest[,names(depDFTest) %in% c("DEP_DEL15")])
+
+
+
+deps.lasso.yhat<-predict(deps.lasso.cv2, xt, s="lambda.1se")
+
+deps.lasso.yprob<-1/(1+exp(-deps.lasso.yhat[,1]))
+
+auc(roc(yt[,1],deps.lasso.yprob))
+plot(roc(yt[,1],deps.lasso.yprob))
+
+```
+constructig data frame for LDA, QDA and NB, and verifying collinearity
+```{r}
+
+XYdf<-data.frame(x)
+XYdf<-(XYdf[,which(names(XYdf) %in% gsub("-",".",gsub("/",".",gsub(" ",".",gsub(",",".",oseDF$name)))))])
+XYdf<-cbind(XYdf,y)
+
+#corr.matrix <- cor(XYdf2[,-76])
+#colinear=which(abs(corr.matrix)>0.8,arr.ind=T)
+#colinear
+
+```
+
+
+
+
+LDA
+
+We are removing collinear variables and eliminating the variables that have 0 variation. We are using cross validation in LDA. We are also plotting the ROC curve for the LDA and using AUC to measure its performance of the LDA model.
+```{r}
+#for (i in names(XYdf))
+#{
+#  if(i!="COUNTDEP60"&i!="COUNTDEP15"){
+#    XYdf[,names(XYdf)==i]=as.factor(XYdf[,names(XYdf)==i])
+#  }
+#}
+
+#removing colinear variables
+XYdf2<-XYdf[,!names(XYdf)%in%c("SCHED_DEP", "UNIQUE_CARRIEREV", "UNIQUE_CARRIERNW", "UNIQUE_CARRIERWN", "UNIQUE_CARRIERYV", "DEST_CITY_NAMEBoston..MA", "DEST_STATE_ABRMA", "DEST_STATE_NMMassachusetts", "DEST_CITY_NAMECharlotte..NC", "DEST_STATE_ABRNC", "DEST_STATE_NMNorth.Carolina", "DEST_CITY_NAMEColumbus..OH", "DEST_CITY_NAMECincinnati..OH", "DEST_STATE_ABRKY", "DEST_STATE_NMKentucky", "DEST_CITY_NAMEDallas.Fort.Worth..TX", "DEST_CITY_NAMEDetroit..MI", "DEST_STATE_ABRMI", "DEST_STATE_NMMichigan", "DEST_CITY_NAMENewark..NJ", "DEST_STATE_ABRNJ", "DEST_CITY_NAMEOrlando..FL", "DEST_CITY_NAMEMiami..FL", "DEST_CITY_NAMEPhiladelphia..PA", "DEST_STATE_ABRPA", "DEST_CITY_NAMEFort.Myers..FL", "DEST_CITY_NAMESan.Diego..CA", "DEST_CITY_NAMETampa..FL", "DEST_STATE_ABRNY", "DEST_STATE_ABRTX", "UNIQUE_CARRIEROO", "DEST_CITY_NAMEMyrtle.Beach..SC", "DEST_STATE_ABRSC", "DEST_CITY_NAMESan.Francisco..CA", "DEST_STATE_ABRNV","CARRIERXE","DESTEWR"
+)]
+#Eliminating Variable that had 0 variation
+XYdf2<-XYdf2[,!names(XYdf2) %in% c("DESTCMH","ARR_TIME_BLK2300.2359")]
+
+XYdf2<-XYdf2[,order(names(XYdf2))]
+
+XYdf2$y2<-revalue(as.factor(XYdf2$y), c("1"="yes", "0"="no"))
+
+
+
+dep.lda<-lda(y~.-y2,data=XYdf2)
+set.seed(12)
+dep.lda.CV<-train(x=XYdf2[,!names(XYdf2)%in%c("y","y2")],y=XYdf2$y2,method='lda',metric="ROC",trControl=trainControl(method='cv',number=5, classProbs = TRUE,summaryFunction = twoClassSummary, allowParallel = TRUE))
+
+dep.lda.CV$results
+
+#auc(roc(XYdf2$y,dep.lda.CV$posterior[,1]))
+#plot(roc(XYdf2$y,dep.lda.CV$posterior[,1]))
+
+
+plot(dep.lda,col=as.numeric(XYdf2$y))
+
+#partimat(y~.,data=XYdf,method="lda")
+
+XYdfTest<-data.frame(xt)
+XYdfTest<-(XYdfTest[,which(names(XYdfTest) %in% gsub("-",".",gsub("/",".",gsub(" ",".",gsub(",",".",oseDF$name)))))])
+XYdfTest<-cbind(XYdfTest,yt)
+XYdfTest$y2<-revalue(as.factor(XYdfTest$yt), c("1"="yes", "0"="no"))
+XYdfTest<-XYdfTest[,!names(XYdfTest)%in%c("SCHED_DEP", "UNIQUE_CARRIEREV", "UNIQUE_CARRIERNW", "UNIQUE_CARRIERWN", "UNIQUE_CARRIERYV", "DEST_CITY_NAMEBoston..MA", "DEST_STATE_ABRMA", "DEST_STATE_NMMassachusetts", "DEST_CITY_NAMECharlotte..NC", "DEST_STATE_ABRNC", "DEST_STATE_NMNorth.Carolina", "DEST_CITY_NAMEColumbus..OH", "DEST_CITY_NAMECincinnati..OH", "DEST_STATE_ABRKY", "DEST_STATE_NMKentucky", "DEST_CITY_NAMEDallas.Fort.Worth..TX", "DEST_CITY_NAMEDetroit..MI", "DEST_STATE_ABRMI", "DEST_STATE_NMMichigan", "DEST_CITY_NAMENewark..NJ", "DEST_STATE_ABRNJ", "DEST_CITY_NAMEOrlando..FL", "DEST_CITY_NAMEMiami..FL", "DEST_CITY_NAMEPhiladelphia..PA", "DEST_STATE_ABRPA", "DEST_CITY_NAMEFort.Myers..FL", "DEST_CITY_NAMESan.Diego..CA", "DEST_CITY_NAMETampa..FL", "DEST_STATE_ABRNY", "DEST_STATE_ABRTX", "UNIQUE_CARRIEROO", "DEST_CITY_NAMEMyrtle.Beach..SC", "DEST_STATE_ABRSC", "DEST_CITY_NAMESan.Francisco..CA", "DEST_STATE_ABRNV","CARRIERXE","DESTEWR")]
+
+#Eliminating Variable that had 0 variation
+XYdfTest<-XYdfTest[,!names(XYdfTest) %in% c("DESTCMH","ARR_TIME_BLK2300.2359")]
+
+XYdfTest<-XYdfTest[,order(names(XYdfTest))]
+
+dep.lda.CV.yhat=predict(dep.lda.CV$finalModel, XYdfTest[,!names(XYdf2)%in%c("y","y2")])
+
+auc(roc(XYdfTest$yt,dep.lda.CV.yhat$posterior[,1]))
+plot(roc(XYdfTest$yt,dep.lda.CV.yhat$posterior[,1]))
+
+
+#lda.yhat<-predict(dep.lda,XYdfTest)
+
+#auc(roc(XYdfTest$yt,lda.yhat$posterior[,1]))
+#plot(roc(XYdfTest$yt,lda.yhat$posterior[,1]))
+
+
+```
+
+
+
+QDA
+
+The removal of collinearity is helpful for QDA. We are creating QDA models and using cross validation in it. We are also plotting the ROC curve for the QDA and using AUC to measure its performance of the QDA model.
+```{r}
+
+
+#write.csv(XYdf2,"d:/users/shina/downloads/xydf2.csv")
+dep.qda<-qda(y~.-y2,data=XYdf2)
+set.seed(123)
+dep.qda.CV<-qda(y~.-y2,data=XYdf2,CV=TRUE)
+
+auc(roc(XYdf2$y,dep.qda.CV$posterior[,1]))
+plot(roc(XYdf2$y,dep.qda.CV$posterior[,1]))
+
+#plot(dep.qda,col=as.numeric(XYdf2$y))
+
+#partimat(y~.,data=XYdf,method="qda")
+
+qda.yhat<-predict(dep.qda,XYdfTest)
+
+auc(roc(XYdfTest$yt,qda.yhat$posterior[,1]))
+plot(roc(XYdfTest$yt,qda.yhat$posterior[,1]))
+```
+
+Naive Bayes
+We are creating Naive Bayes model and using cross validation in it. We are also plotting the ROC curve for the Naive Bayes and using AUC to measure its performance of the Naive Bayes model.
+```{r cache=TRUE, warning=FALSE}
+#dep.nb=NaiveBayes(as.factor(y)~., data=XYdf2,usekernel = TRUE)
+#summary(dep.nb)
+options(warn=-1)
+dep.nb.cv = train(x=XYdf2[,!names(XYdf2)%in%c("y","y2")],y=XYdf2$y2,'nb',metric="ROC",trControl=trainControl(method='cv',number=5,summaryFunction = twoClassSummary, classProbs = TRUE, allowParallel = TRUE, verboseIter = TRUE))
+dep.nb.cv$results
+dep.nb.cv.yhat=predict (dep.nb.cv$finalModel, XYdfTest)
+
+auc(roc(XYdfTest$yt,dep.nb.cv.yhat$posterior[,1]))
+plot(roc(XYdfTest$yt,dep.nb.cv.yhat$posterior[,1]))
+
+
+#table(nb.pred$class, Pfdnn$DEP_DEL15) 
+#mean(nb.pred$class==Pfdnn$DEP_DEL15)
+
+```
+
+We merge the levels of 2017 with 2006 to make sure we have the levels in both data sets and we can run trees in 2017
+```{r}
+for(i in names(depDFTrain)){
+  iname = which(names(depDFTrain)==i)
+  if (is.factor(depDFTrain[,iname])){
+    levels2017<-levels(depDF2017[,which(names(depDF2017)==i)])
+    missing<-which(!levels2017 %in% levels(depDFTrain[,iname]))
+    if (length(missing)>0) {
+      levels(depDFTrain[,iname])<-c(levels(depDFTrain[,iname]),levels2017[missing])
+      print(i)
+    }
+  }
+}
+```
+
+
+
+Trees
+
+We are creating Decision Trees model. We are also plotting the ROC curve for the Decision Trees and using AUC to measure its performance of the Decision Trees model.
+```{r}
+set.seed(123)
+
+for (i in names(depDFTrain))
+{
+  if(i!="COUNTDEP60"& i!="COUNTDEP30"&i!="COUNTDEP15") {
+    depDFTrain[,names(depDFTrain)==i]=as.factor(depDFTrain[,names(depDFTrain)==i])
+  }
+}
+
+varselect<-c("DEP_DEL15",	"QUARTER",	"MONTH",	"DAY_OF_MONTH",	"DAY_OF_WEEK",	"UNIQUE_CARRIER",	"AIRLINE_ID",	"CARRIER",	"ORIGIN_AIRPORT_ID",	"ORIGIN_AIRPORT_SEQ_ID",	"ORIGIN_CITY_MARKET_ID",	"ORIGIN",	"ORIGIN_CITY_NAME",	"ORIGIN_STATE_ABR",	"ORIGIN_STATE_FIPS",	"ORIGIN_STATE_NM",	"ORIGIN_WAC",	"DEST_AIRPORT_ID",	"DEST_CITY_MARKET_ID",	"DEST",	"DEST_CITY_NAME",	"DEST_STATE_ABR",	"DEST_STATE_FIPS",	"DEST_STATE_NM",	"DEST_WAC",	"DEP_TIME_BLK",	"ARR_TIME_BLK",		"FLIGHTS",	"DISTANCE",	"DISTANCE_GROUP",		"COUNTDEP15",	"COUNTDEP30",	"COUNTDEP60",	"PREV_ARRDELAY24")
+
+depDFTrain2<- subset(depDFTrain,select = varselect )
+
+
+
+for (i in names(depDFTest))
+{
+  if(i!="COUNTDEP60"& i!="COUNTDEP30"& i!="COUNTDEP15") {
+    depDFTest[,names(depDFTest)==i]=as.factor(depDFTest[,names(depDFTest)==i])
+  }
+}
+
+depDFTest2<-subset(depDFTest,select = varselect )
+
+levels(depDFTest2$DEP_DEL15) <- levels(depDFTrain2$DEP_DEL15)
+levels(depDFTest2$QUARTER) <- levels(depDFTrain2$QUARTER)
+levels(depDFTest2$MONTH) <- levels(depDFTrain2$MONTH)
+levels(depDFTest2$DAY_OF_MONTH) <- levels(depDFTrain2$DAY_OF_MONTH)
+levels(depDFTest2$DAY_OF_WEEK) <- levels(depDFTrain2$DAY_OF_WEEK)
+levels(depDFTest2$UNIQUE_CARRIER) <- levels(depDFTrain2$UNIQUE_CARRIER)
+levels(depDFTest2$AIRLINE_ID) <- levels(depDFTrain2$AIRLINE_ID)
+levels(depDFTest2$CARRIER) <- levels(depDFTrain2$CARRIER)
+levels(depDFTest2$ORIGIN_AIRPORT_ID) <- levels(depDFTrain2$ORIGIN_AIRPORT_ID)
+levels(depDFTest2$ORIGIN_AIRPORT_SEQ_ID) <- levels(depDFTrain2$ORIGIN_AIRPORT_SEQ_ID)
+levels(depDFTest2$ORIGIN_CITY_MARKET_ID) <- levels(depDFTrain2$ORIGIN_CITY_MARKET_ID)
+levels(depDFTest2$ORIGIN) <- levels(depDFTrain2$ORIGIN)
+levels(depDFTest2$ORIGIN_CITY_NAME) <- levels(depDFTrain2$ORIGIN_CITY_NAME)
+levels(depDFTest2$ORIGIN_STATE_ABR) <- levels(depDFTrain2$ORIGIN_STATE_ABR)
+levels(depDFTest2$ORIGIN_STATE_FIPS) <- levels(depDFTrain2$ORIGIN_STATE_FIPS)
+levels(depDFTest2$ORIGIN_STATE_NM) <- levels(depDFTrain2$ORIGIN_STATE_NM)
+levels(depDFTest2$ORIGIN_WAC) <- levels(depDFTrain2$ORIGIN_WAC)
+levels(depDFTest2$DEST_AIRPORT_ID) <- levels(depDFTrain2$DEST_AIRPORT_ID)
+levels(depDFTest2$DEST_AIRPORT_SEQ_ID) <- levels(depDFTrain2$DEST_AIRPORT_SEQ_ID)
+levels(depDFTest2$DEST_CITY_MARKET_ID) <- levels(depDFTrain2$DEST_CITY_MARKET_ID)
+levels(depDFTest2$DEST) <- levels(depDFTrain2$DEST)
+levels(depDFTest2$DEST_CITY_NAME) <- levels(depDFTrain2$DEST_CITY_NAME)
+levels(depDFTest2$DEST_STATE_ABR) <- levels(depDFTrain2$DEST_STATE_ABR)
+levels(depDFTest2$DEST_STATE_FIPS) <- levels(depDFTrain2$DEST_STATE_FIPS)
+levels(depDFTest2$DEST_STATE_NM) <- levels(depDFTrain2$DEST_STATE_NM)
+levels(depDFTest2$DEST_WAC) <- levels(depDFTrain2$DEST_WAC)
+levels(depDFTest2$DEP_TIME_BLK) <- levels(depDFTrain2$DEP_TIME_BLK)
+levels(depDFTest2$ARR_TIME_BLK) <- levels(depDFTrain2$ARR_TIME_BLK)
+levels(depDFTest2$FLIGHTS) <- levels(depDFTrain2$FLIGHTS)
+levels(depDFTest2$DISTANCE) <- levels(depDFTrain2$DISTANCE)
+levels(depDFTest2$DISTANCE_GROUP) <- levels(depDFTrain2$DISTANCE_GROUP)
+levels(depDFTest2$PREV_ARRDELAY24) <- levels(depDFTrain2$PREV_ARRDELAY24)
+
+dep.tree<-rpart(DEP_DEL15~., data=depDFTrain2)
+plot(dep.tree)
+text(dep.tree)
+
+dep.party <- as.party(dep.tree)
+plot(dep.party,gp = gpar(fontsize = 10))
+
+tree.prob.estimates<-predict(dep.tree, newdata=depDFTest2,type="prob")
+
+tree.prob.estimates1<-as.numeric(tree.prob.estimates[,2])
+
+auc(roc(depDFTest2$DEP_DEL15,tree.prob.estimates1))
+plot(roc(depDFTest2$DEP_DEL15,tree.prob.estimates1))
+```
+
+
+
+Random Forest
+
+We are creating Random Forest model and using cross validation in it. We are also plotting the ROC curve for the Random Forest and using AUC to measure its performance of the Random Forest model.
+```{r}
+# Tree models
+
+set.seed(123)
+
+
+
+library(pROC)
+
+
+for (i in names(depDFTrain))
+{
+  if(i!="COUNTDEP60"& i!="COUNTDEP30"&i!="COUNTDEP15") {
+    depDFTrain[,names(depDFTrain)==i]=as.factor(depDFTrain[,names(depDFTrain)==i])
+  }
+}
+
+varselect<-c("DEP_DEL15",	"QUARTER",	"MONTH",	"DAY_OF_MONTH",	"DAY_OF_WEEK",	"UNIQUE_CARRIER",	"AIRLINE_ID",	"CARRIER",	"ORIGIN_AIRPORT_ID",	"ORIGIN_AIRPORT_SEQ_ID",	"ORIGIN_CITY_MARKET_ID",	"ORIGIN",	"ORIGIN_CITY_NAME",	"ORIGIN_STATE_ABR",	"ORIGIN_STATE_FIPS",	"ORIGIN_STATE_NM",	"ORIGIN_WAC",	"DEST_AIRPORT_ID",	"DEST_CITY_MARKET_ID",	"DEST",	"DEST_CITY_NAME",	"DEST_STATE_ABR",	"DEST_STATE_FIPS",	"DEST_STATE_NM",	"DEST_WAC",	"DEP_TIME_BLK",	"ARR_TIME_BLK",		"FLIGHTS",	"DISTANCE",	"DISTANCE_GROUP",		"COUNTDEP15",	"COUNTDEP30",	"COUNTDEP60",	"PREV_ARRDELAY24")
+
+depDFTrain2<- subset(depDFTrain,select = varselect )
+
+randomForest.Pfdn<-randomForest( DEP_DEL15~.,data=depDFTrain2)
+
+
+importance(randomForest.Pfdn)
+varImpPlot(randomForest.Pfdn)
+
+
+
+
+for (i in names(depDFTest))
+{
+  if(i!="COUNTDEP60"&i!="COUNTDEP30"&i!="COUNTDEP15") {
+    depDFTest[,names(depDFTest)==i]=as.factor(depDFTest[,names(depDFTest)==i])
+    
+  }
+  
+}
+depDFTest2<-subset(depDFTest,select = varselect )
+
+levels(depDFTest2$DEP_DEL15) <- levels(depDFTrain2$DEP_DEL15)
+levels(depDFTest2$QUARTER) <- levels(depDFTrain2$QUARTER)
+levels(depDFTest2$MONTH) <- levels(depDFTrain2$MONTH)
+levels(depDFTest2$DAY_OF_MONTH) <- levels(depDFTrain2$DAY_OF_MONTH)
+levels(depDFTest2$DAY_OF_WEEK) <- levels(depDFTrain2$DAY_OF_WEEK)
+levels(depDFTest2$UNIQUE_CARRIER) <- levels(depDFTrain2$UNIQUE_CARRIER)
+levels(depDFTest2$AIRLINE_ID) <- levels(depDFTrain2$AIRLINE_ID)
+levels(depDFTest2$CARRIER) <- levels(depDFTrain2$CARRIER)
+levels(depDFTest2$ORIGIN_AIRPORT_ID) <- levels(depDFTrain2$ORIGIN_AIRPORT_ID)
+levels(depDFTest2$ORIGIN_AIRPORT_SEQ_ID) <- levels(depDFTrain2$ORIGIN_AIRPORT_SEQ_ID)
+levels(depDFTest2$ORIGIN_CITY_MARKET_ID) <- levels(depDFTrain2$ORIGIN_CITY_MARKET_ID)
+levels(depDFTest2$ORIGIN) <- levels(depDFTrain2$ORIGIN)
+levels(depDFTest2$ORIGIN_CITY_NAME) <- levels(depDFTrain2$ORIGIN_CITY_NAME)
+levels(depDFTest2$ORIGIN_STATE_ABR) <- levels(depDFTrain2$ORIGIN_STATE_ABR)
+levels(depDFTest2$ORIGIN_STATE_FIPS) <- levels(depDFTrain2$ORIGIN_STATE_FIPS)
+levels(depDFTest2$ORIGIN_STATE_NM) <- levels(depDFTrain2$ORIGIN_STATE_NM)
+levels(depDFTest2$ORIGIN_WAC) <- levels(depDFTrain2$ORIGIN_WAC)
+levels(depDFTest2$DEST_AIRPORT_ID) <- levels(depDFTrain2$DEST_AIRPORT_ID)
+levels(depDFTest2$DEST_AIRPORT_SEQ_ID) <- levels(depDFTrain2$DEST_AIRPORT_SEQ_ID)
+levels(depDFTest2$DEST_CITY_MARKET_ID) <- levels(depDFTrain2$DEST_CITY_MARKET_ID)
+levels(depDFTest2$DEST) <- levels(depDFTrain2$DEST)
+levels(depDFTest2$DEST_CITY_NAME) <- levels(depDFTrain2$DEST_CITY_NAME)
+levels(depDFTest2$DEST_STATE_ABR) <- levels(depDFTrain2$DEST_STATE_ABR)
+levels(depDFTest2$DEST_STATE_FIPS) <- levels(depDFTrain2$DEST_STATE_FIPS)
+levels(depDFTest2$DEST_STATE_NM) <- levels(depDFTrain2$DEST_STATE_NM)
+levels(depDFTest2$DEST_WAC) <- levels(depDFTrain2$DEST_WAC)
+levels(depDFTest2$DEP_TIME_BLK) <- levels(depDFTrain2$DEP_TIME_BLK)
+levels(depDFTest2$ARR_TIME_BLK) <- levels(depDFTrain2$ARR_TIME_BLK)
+levels(depDFTest2$FLIGHTS) <- levels(depDFTrain2$FLIGHTS)
+levels(depDFTest2$DISTANCE) <- levels(depDFTrain2$DISTANCE)
+levels(depDFTest2$DISTANCE_GROUP) <- levels(depDFTrain2$DISTANCE_GROUP)
+levels(depDFTest2$PREV_ARRDELAY24) <- levels(depDFTrain2$PREV_ARRDELAY24)
+
+
+
+rf.prob.estimates<-predict(randomForest.Pfdn, newdata=depDFTest2,type="prob")
+
+
+rf.prob.estimates1<-as.numeric(rf.prob.estimates[,2])
+
+
+auc(roc(depDFTest2$DEP_DEL15,rf.prob.estimates1))
+plot(roc(depDFTest2$DEP_DEL15,rf.prob.estimates1))
+```
+
+
+Boosting
+
+We remove SHED_DEP AND SCHED_ARR  because they are not numeric, ordered or factor and FL_NUM AND TAIL_NUM for computation time.
+We are creating Boosting model and using cross validation in it. We are also plotting the ROC curve for the Boosting and using AUC to measure its performance of the Boosting model.
+```{r cache=TRUE}
+set.seed(12)
+gbmGrid <-expand.grid(interaction.depth = c(1:4),
+                        n.trees = c(1:20)*75, 
+                        shrinkage = c(0.1,0.01,0.001),
+                        n.minobsinnode = 10)
+depDFTrain$PREV_ARRDELAY24<-as.factor(depDFTrain$PREV_ARRDELAY24)
+depDFTrain$y2=as.factor(depDFTrain$DEP_DEL15)
+depDFTrain$y2=revalue(depDFTrain$y2,c("1"="yes","0"="no"))
+boost.dep.cv=train(x=depDFTrain[,names(depDFTrain)%in%c("QUARTER","MONTH","DAY_OF_MONTH","DAY_OF_WEEK","UNIQUE_CARRIER","AIRLINE_ID","CARRIER","ORIGIN_AIRPORT_ID","ORIGIN_AIRPORT_SEQ_ID","ORIGIN_CITY_MARKET_ID","ORIGIN","ORIGIN_CITY_NAME","ORIGIN_STATE_ABR","ORIGIN_STATE_FIPS","ORIGIN_STATE_NM","ORIGIN_WAC","DEST_AIRPORT_ID","DEST_AIRPORT_SEQ_ID","DEST_CITY_MARKET_ID","DEST","DEST_CITY_NAME","DEST_STATE_ABR","DEST_STATE_FIPS","DEST_STATE_NM","DEST_WAC","DEP_TIME_BLK","ARR_TIME_BLK","CRS_ELAPSED_TIME","FLIGHTS","DISTANCE","DISTANCE_GROUP","COUNTDEP15","COUNTDEP30","COUNTDEP60","PREV_ARRDELAY24")],y=depDFTrain$y2,method='gbm',metric="ROC",trControl=trainControl(method='cv',number=5,summaryFunction = twoClassSummary, classProbs = TRUE, allowParallel = TRUE), tuneGrid=gbmGrid, distribution="bernoulli",verbose=FALSE)
+boost.dep.cv$results
+boost.dep.cv$finalModel
+boost.dep.cv
+```
+
+```{r}
+summary(boost.dep.cv$finalModel)
+plot(boost.dep.cv$finalModel,i="PREV_ARRDELAY24")	
+plot(boost.dep.cv$finalModel,i="DEP_TIME_BLK")
+plot(boost.dep.cv$finalModel,i="ARR_TIME_BLK")
+plot(boost.dep.cv$finalModel,i="DEST")	
+plot(boost.dep.cv$finalModel,i="UNIQUE_CARRIER")
+```
+
+
+```{r}
+yhat.boost=predict (boost.dep.cv$finalModel ,newdata =depDFTest[,names(depDFTrain)%in%c("QUARTER","MONTH","DAY_OF_MONTH","DAY_OF_WEEK","UNIQUE_CARRIER","AIRLINE_ID","CARRIER","ORIGIN_AIRPORT_ID","ORIGIN_AIRPORT_SEQ_ID","ORIGIN_CITY_MARKET_ID","ORIGIN","ORIGIN_CITY_NAME","ORIGIN_STATE_ABR","ORIGIN_STATE_FIPS","ORIGIN_STATE_NM","ORIGIN_WAC","DEST_AIRPORT_ID","DEST_AIRPORT_SEQ_ID","DEST_CITY_MARKET_ID","DEST","DEST_CITY_NAME","DEST_STATE_ABR","DEST_STATE_FIPS","DEST_STATE_NM","DEST_WAC","DEP_TIME_BLK","ARR_TIME_BLK","CRS_ELAPSED_TIME","FLIGHTS","DISTANCE","DISTANCE_GROUP","COUNTDEP15","COUNTDEP30","COUNTDEP60","PREV_ARRDELAY24")], n.trees=1500) 
+yhat.cat=ifelse(1-yhat.boost>=0.5,1,0)
+mean((yhat.cat-as.numeric(depDFTest$DEP_DEL15))^2) 
+table(yhat.cat,depDFTest$DEP_DEL15)
+
+auc(roc(depDFTest$DEP_DEL15,1-yhat.boost))
+plot(roc(depDFTest$DEP_DEL15,1-yhat.boost))
+```
+
+
+Testing Lasso in 2017 Data
+```{r}
+x2017<-model.matrix(~ QUARTER+MONTH+DAY_OF_MONTH+DAY_OF_WEEK+UNIQUE_CARRIER+AIRLINE_ID+CARRIER+ORIGIN_AIRPORT_ID+ORIGIN_AIRPORT_SEQ_ID+ORIGIN_CITY_MARKET_ID+ORIGIN+ORIGIN_CITY_NAME+ORIGIN_STATE_ABR+ORIGIN_STATE_FIPS+ORIGIN_STATE_NM+ORIGIN_WAC+DEST_AIRPORT_ID+DEST_AIRPORT_SEQ_ID+DEST_CITY_MARKET_ID+DEST+DEST_CITY_NAME+DEST_STATE_ABR+DEST_STATE_FIPS+DEST_STATE_NM+DEST_WAC+DEP_TIME_BLK+ARR_TIME_BLK+CRS_ELAPSED_TIME+FLIGHTS+DISTANCE+DISTANCE_GROUP+COUNTDEP15+COUNTDEP30+COUNTDEP60+PREV_ARRDELAY24,depDF2017)
+y2017<-as.matrix(depDF2017[,names(depDF2017) %in% c("DEP_DEL15")])
+
+for(i in colnames(x2017)){
+  if(!i%in%colnames(x)){
+    index = which(colnames(x2017)==i)
+    x2017<-x2017[,-index]
+  }
+}
+
+
+
+
+
+deps.lasso.2017<-predict(deps.lasso.cv2, x2017, s="lambda.1se")
+
+deps.lasso.2017p<-1/(1+exp(-deps.lasso.2017[,1]))
+
+auc(roc(y2017[,1],deps.lasso.2017p))
+plot(roc(y2017[,1],deps.lasso.2017p))
+
+```
+
+
+
+
+
+LDA prediction
+We perform LDA prediction on the 2017 data
+```{r}
+
+XYdf2017<-data.frame(x2017)
+XYdf2017<-(XYdf2017[,which(names(XYdf2017) %in% gsub("-",".",gsub("/",".",gsub(" ",".",gsub(",",".",oseDF$name)))))])
+XYdf2017<-cbind(XYdf2017,y2017)
+XYdf2017$y2<-revalue(as.factor(XYdf2017$y2017), c("1"="yes", "0"="no"))
+XYdf2017<-XYdf2017[,!names(XYdf2017)%in%c("SCHED_DEP", "UNIQUE_CARRIEREV", "UNIQUE_CARRIERNW", "UNIQUE_CARRIERWN", "UNIQUE_CARRIERYV", "DEST_CITY_NAMEBoston..MA", "DEST_STATE_ABRMA", "DEST_STATE_NMMassachusetts", "DEST_CITY_NAMECharlotte..NC", "DEST_STATE_ABRNC", "DEST_STATE_NMNorth.Carolina", "DEST_CITY_NAMEColumbus..OH", "DEST_CITY_NAMECincinnati..OH", "DEST_STATE_ABRKY", "DEST_STATE_NMKentucky", "DEST_CITY_NAMEDallas.Fort.Worth..TX", "DEST_CITY_NAMEDetroit..MI", "DEST_STATE_ABRMI", "DEST_STATE_NMMichigan", "DEST_CITY_NAMENewark..NJ", "DEST_STATE_ABRNJ", "DEST_CITY_NAMEOrlando..FL", "DEST_CITY_NAMEMiami..FL", "DEST_CITY_NAMEPhiladelphia..PA", "DEST_STATE_ABRPA", "DEST_CITY_NAMEFort.Myers..FL", "DEST_CITY_NAMESan.Diego..CA", "DEST_CITY_NAMETampa..FL", "DEST_STATE_ABRNY", "DEST_STATE_ABRTX", "UNIQUE_CARRIEROO", "DEST_CITY_NAMEMyrtle.Beach..SC", "DEST_STATE_ABRSC", "DEST_CITY_NAMESan.Francisco..CA", "DEST_STATE_ABRNV","CARRIERXE","DESTEWR")]
+
+#Eliminating Variable that had 0 variation
+XYdf2017<-XYdf2017[,!names(XYdf2017) %in% c("DESTCMH","ARR_TIME_BLK2300.2359")]
+XYdf2017<-XYdf2017[,order(names(XYdf2017))]
+dep.lda.CV.yhat2017=predict(dep.lda.CV$finalModel, XYdf2017[,!names(XYdf2017)%in%c("y2017","y2")])
+
+names(XYdf2)
+names(XYdf2017)
+
+auc(roc(XYdf2017$y2017,dep.lda.CV.yhat2017$posterior[,1]))
+plot(roc(XYdf2017$y2017,dep.lda.CV.yhat2017$posterior[,1]))
+
+
+```
+
+QDA FOR 2017
+```{r}
+
+
+#write.csv(XYdf2,"d:/users/shina/downloads/xydf2.csv")
+#plot(dep.qda,col=as.numeric(XYdf2$y))
+
+#partimat(y~.,data=XYdf,method="qda")
+
+qda.yhat2017<-predict(dep.qda,XYdf2017)
+
+auc(roc(XYdfTest$yt,qda.yhat$posterior[,1]))
+plot(roc(XYdfTest$yt,qda.yhat$posterior[,1]))
+
+```
+
+Naive Bayes 2017
+```{r cache=TRUE}
+
+dep.nb.cv.2017=predict (dep.nb.cv$finalModel, XYdf2017)
+
+auc(roc(XYdf2017$y2017,dep.nb.cv.2017$posterior[,1]))
+plot(roc(XYdf2017$y2017,dep.nb.cv.2017$posterior[,1]))
+
+
+```
+
+
+
+Predict boost for 2017
+```{r}
+yhat.boost2017=predict (boost.dep.cv$finalModel ,newdata =depDF2017[,names(depDF2017)%in%c("QUARTER","MONTH","DAY_OF_MONTH","DAY_OF_WEEK","UNIQUE_CARRIER","AIRLINE_ID","CARRIER","ORIGIN_AIRPORT_ID","ORIGIN_AIRPORT_SEQ_ID","ORIGIN_CITY_MARKET_ID","ORIGIN","ORIGIN_CITY_NAME","ORIGIN_STATE_ABR","ORIGIN_STATE_FIPS","ORIGIN_STATE_NM","ORIGIN_WAC","DEST_AIRPORT_ID","DEST_AIRPORT_SEQ_ID","DEST_CITY_MARKET_ID","DEST","DEST_CITY_NAME","DEST_STATE_ABR","DEST_STATE_FIPS","DEST_STATE_NM","DEST_WAC","DEP_TIME_BLK","ARR_TIME_BLK","CRS_ELAPSED_TIME","FLIGHTS","DISTANCE","DISTANCE_GROUP","COUNTDEP15","COUNTDEP30","COUNTDEP60","PREV_ARRDELAY24")], n.trees=1500) 
+yhat.cat2017=ifelse(1-yhat.boost2017>=0.5,1,0)
+mean((yhat.cat2017-as.numeric(depDF2017$DEP_DEL15))^2) 
+table(yhat.cat2017,depDF2017$DEP_DEL15)
+
+auc(roc(depDF2017$DEP_DEL15,1-yhat.boost2017))
+plot(roc(depDF2017$DEP_DEL15,1-yhat.boost2017))
+
+stopCluster(cl)
+rm(cl)
+```
+Tree 2017  #rerunning code from above because it had an error and we don't want to lose cached chunks
+
+```{r}
+for(i in names(depDFTrain)){
+  iname = which(names(depDFTrain)==i)
+  if (is.factor(depDFTrain[,iname])){
+    levels2017<-levels(depDF2017[,which(names(depDF2017)==i)])
+    missing<-which(!levels2017 %in% levels(depDFTrain[,iname]))
+    if (length(missing)>0) {
+      levels(depDFTrain[,iname])<-c(levels(depDFTrain[,iname]),levels2017[missing])
+      print(i)
+    }
+  }
+}
+
+for(i in names(depDF2017)){
+  iname = which(names(depDF2017)==i)
+  if (is.factor(depDF2017[,iname])){
+    levels2006<-levels(depDFTrain[,which(names(depDFTrain)==i)])
+    missing<-which(!levels2006 %in% levels(depDF2017[,iname]))
+    if (length(missing)>0) {
+      levels(depDF2017[,iname])<-c(levels(depDF2017[,iname]),levels2006[missing])
+    }
+  }
+}
+
+for (i in names(depDFTrain))
+{
+  if(i!="COUNTDEP60"& i!="COUNTDEP30"&i!="COUNTDEP15") {
+    depDFTrain[,names(depDFTrain)==i]=as.factor(depDFTrain[,names(depDFTrain)==i])
+  }
+}
+
+varselect<-c("DEP_DEL15",	"QUARTER",	"MONTH",	"DAY_OF_MONTH",	"DAY_OF_WEEK",	"UNIQUE_CARRIER",	"AIRLINE_ID",	"CARRIER",	"ORIGIN_AIRPORT_ID",	"ORIGIN_AIRPORT_SEQ_ID",	"ORIGIN_CITY_MARKET_ID",	"ORIGIN",	"ORIGIN_CITY_NAME",	"ORIGIN_STATE_ABR",	"ORIGIN_STATE_FIPS",	"ORIGIN_STATE_NM",	"ORIGIN_WAC",	"DEST_AIRPORT_ID",	"DEST_CITY_MARKET_ID",	"DEST",	"DEST_CITY_NAME",	"DEST_STATE_ABR",	"DEST_STATE_FIPS",	"DEST_STATE_NM",	"DEST_WAC",	"DEP_TIME_BLK",	"ARR_TIME_BLK",		"FLIGHTS",	"DISTANCE",	"DISTANCE_GROUP",		"COUNTDEP15",	"COUNTDEP30",	"COUNTDEP60",	"PREV_ARRDELAY24")
+
+depDFTrain2<- subset(depDFTrain,select = varselect )
+
+
+
+for (i in names(depDFTest))
+{
+  if(i!="COUNTDEP60"& i!="COUNTDEP30"& i!="COUNTDEP15") {
+    depDFTest[,names(depDFTest)==i]=as.factor(depDFTest[,names(depDFTest)==i])
+  }
+}
+
+depDFTest2<-subset(depDFTest,select = varselect )
+
+levels(depDFTest2$DEP_DEL15) <- levels(depDFTrain2$DEP_DEL15)
+levels(depDFTest2$QUARTER) <- levels(depDFTrain2$QUARTER)
+levels(depDFTest2$MONTH) <- levels(depDFTrain2$MONTH)
+levels(depDFTest2$DAY_OF_MONTH) <- levels(depDFTrain2$DAY_OF_MONTH)
+levels(depDFTest2$DAY_OF_WEEK) <- levels(depDFTrain2$DAY_OF_WEEK)
+levels(depDFTest2$UNIQUE_CARRIER) <- levels(depDFTrain2$UNIQUE_CARRIER)
+levels(depDFTest2$AIRLINE_ID) <- levels(depDFTrain2$AIRLINE_ID)
+levels(depDFTest2$CARRIER) <- levels(depDFTrain2$CARRIER)
+levels(depDFTest2$ORIGIN_AIRPORT_ID) <- levels(depDFTrain2$ORIGIN_AIRPORT_ID)
+levels(depDFTest2$ORIGIN_AIRPORT_SEQ_ID) <- levels(depDFTrain2$ORIGIN_AIRPORT_SEQ_ID)
+levels(depDFTest2$ORIGIN_CITY_MARKET_ID) <- levels(depDFTrain2$ORIGIN_CITY_MARKET_ID)
+levels(depDFTest2$ORIGIN) <- levels(depDFTrain2$ORIGIN)
+levels(depDFTest2$ORIGIN_CITY_NAME) <- levels(depDFTrain2$ORIGIN_CITY_NAME)
+levels(depDFTest2$ORIGIN_STATE_ABR) <- levels(depDFTrain2$ORIGIN_STATE_ABR)
+levels(depDFTest2$ORIGIN_STATE_FIPS) <- levels(depDFTrain2$ORIGIN_STATE_FIPS)
+levels(depDFTest2$ORIGIN_STATE_NM) <- levels(depDFTrain2$ORIGIN_STATE_NM)
+levels(depDFTest2$ORIGIN_WAC) <- levels(depDFTrain2$ORIGIN_WAC)
+levels(depDFTest2$DEST_AIRPORT_ID) <- levels(depDFTrain2$DEST_AIRPORT_ID)
+levels(depDFTest2$DEST_AIRPORT_SEQ_ID) <- levels(depDFTrain2$DEST_AIRPORT_SEQ_ID)
+levels(depDFTest2$DEST_CITY_MARKET_ID) <- levels(depDFTrain2$DEST_CITY_MARKET_ID)
+levels(depDFTest2$DEST) <- levels(depDFTrain2$DEST)
+levels(depDFTest2$DEST_CITY_NAME) <- levels(depDFTrain2$DEST_CITY_NAME)
+levels(depDFTest2$DEST_STATE_ABR) <- levels(depDFTrain2$DEST_STATE_ABR)
+levels(depDFTest2$DEST_STATE_FIPS) <- levels(depDFTrain2$DEST_STATE_FIPS)
+levels(depDFTest2$DEST_STATE_NM) <- levels(depDFTrain2$DEST_STATE_NM)
+levels(depDFTest2$DEST_WAC) <- levels(depDFTrain2$DEST_WAC)
+levels(depDFTest2$DEP_TIME_BLK) <- levels(depDFTrain2$DEP_TIME_BLK)
+levels(depDFTest2$ARR_TIME_BLK) <- levels(depDFTrain2$ARR_TIME_BLK)
+levels(depDFTest2$FLIGHTS) <- levels(depDFTrain2$FLIGHTS)
+levels(depDFTest2$DISTANCE) <- levels(depDFTrain2$DISTANCE)
+levels(depDFTest2$DISTANCE_GROUP) <- levels(depDFTrain2$DISTANCE_GROUP)
+levels(depDFTest2$PREV_ARRDELAY24) <- levels(depDFTrain2$PREV_ARRDELAY24)
+
+dep.tree<-rpart(DEP_DEL15~., data=depDFTrain2)
+
+set.seed(123)
+
+
+
+library(pROC)
+
+
+for (i in names(depDFTrain))
+{
+  if(i!="COUNTDEP60"& i!="COUNTDEP30"&i!="COUNTDEP15") {
+    depDFTrain[,names(depDFTrain)==i]=as.factor(depDFTrain[,names(depDFTrain)==i])
+  }
+}
+
+varselect<-c("DEP_DEL15",	"QUARTER",	"MONTH",	"DAY_OF_MONTH",	"DAY_OF_WEEK",	"UNIQUE_CARRIER",	"AIRLINE_ID",	"CARRIER",	"ORIGIN_AIRPORT_ID",	"ORIGIN_AIRPORT_SEQ_ID",	"ORIGIN_CITY_MARKET_ID",	"ORIGIN",	"ORIGIN_CITY_NAME",	"ORIGIN_STATE_ABR",	"ORIGIN_STATE_FIPS",	"ORIGIN_STATE_NM",	"ORIGIN_WAC",	"DEST_AIRPORT_ID",	"DEST_CITY_MARKET_ID",	"DEST",	"DEST_CITY_NAME",	"DEST_STATE_ABR",	"DEST_STATE_FIPS",	"DEST_STATE_NM",	"DEST_WAC",	"DEP_TIME_BLK",	"ARR_TIME_BLK",		"FLIGHTS",	"DISTANCE",	"DISTANCE_GROUP",		"COUNTDEP15",	"COUNTDEP30",	"COUNTDEP60",	"PREV_ARRDELAY24")
+
+depDFTrain2<- subset(depDFTrain,select = varselect )
+
+randomForest.Pfdn<-randomForest( DEP_DEL15~.,data=depDFTrain2)
+
+for (i in names(depDF2017))
+{
+  if(i!="COUNTDEP60"& i!="COUNTDEP30"&i!="COUNTDEP15") {
+    depDF2017[,names(depDF2017)==i]=as.factor(depDF2017[,names(depDF2017)==i])
+  }
+}
+
+depDF20172<-subset(depDF2017,select = varselect )
+
+tree.prob.estimates2017<-predict(dep.tree, newdata=depDF20172,type="prob")
+
+tree.prob.estimates20171<-as.numeric(tree.prob.estimates2017[,2])
+
+auc(roc(depDF20172$DEP_DEL15,tree.prob.estimates20171))
+plot(roc(depDF20172$DEP_DEL15,tree.prob.estimates20171))
+
+```
+
+Random forest 2017
+```{r}
+
+
+for (i in names(depDF2017))
+{
+  if(i!="COUNTDEP60"& i!="COUNTDEP30"&i!="COUNTDEP15") {
+    depDF2017[,names(depDF2017)==i]=as.factor(depDF2017[,names(depDF2017)==i])
+  }
+}
+
+depDF20172<-subset(depDF2017,select = varselect )
+
+
+rf.prob.estimates2017<-predict(randomForest.Pfdn, newdata=depDF20172,type="prob")
+
+rf.prob.estimates20171<-as.numeric(rf.prob.estimates2017[,2])
+
+
+auc(roc(depDF2017$DEP_DEL15,rf.prob.estimates20171))
+plot(roc(depDF2017$DEP_DEL15,rf.prob.estimates20171))
+
+```
+
+
+Interpretation of the results:
+
+These are the results we got when we ran each process. (in case it differs slightly from the one that appears in the knitting)
+
+Lasso CV : 0.838    
+Lasso Test : 0.826
+
+LDA CV : 0.836    
+LDA Test :  0.8211
+
+QDA CV : 0.7606     
+QDA Test : 0.7462
+
+Naive Bayes CV: 0.827 
+Naive Bayes Test: 0.814
+
+Trees Test : 0.7713
+
+Random Forest : 0.828
+
+Boosting CV : Interaction depth 4 1500 trees Shrinkage 0.01: 0.848
+
+Boosting Test : 0.837
+
+
+2017 test data:
+
+Lasso : 0.8045
+
+LDA : 0.8224
+
+QDA : 0.7462
+
+Naive Bayes : 0.8059
+
+Tree : 0.792
+
+Random Forest : 0.8067
+
+Boosting : 0.803
+
+We observe that all the models except trees and QDA had an AUC above 0.8 when training and testing in the 2006 data. However, we see a decline in performance for all models except LDA when applying to the 2017 test data.  This shows the importance of retraining the models frequently, as its predictive power becomes inconsistent over time. 
+
+Below we show the confusion matrix for the best performance we got while testing in 2006 data for the boosted trees. This shows how a newly trained model could perform in practice.
+
+yhat.cat     0     1
+       0 10905  1120
+       1   574  1348
+
+A false positive (predicted delay, no actual delay) would be very costly because passengers could arrive late to a flight and miss it. A false negative (predicted no delay, actual delay) has a cost in terms of annoyance to customers, and loss of time, that could imply high costs like missing a  meeting. Sensitivity is therefore our most important metric.
+
+This is the same confusion matrix for boosting in 2017 data.
+
+yhat.cat2017     0     1
+           0 23605  1831
+           1   605  1963
+
+To conclude we would like to say that it is important to retrain the models frequently.
